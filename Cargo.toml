@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 scrap = "0.5.0"
 image = "0.24"
+
+[[bin]]
+name="fps_test"
+path="src/tests/scrap_fps.rs"

@@ -26,11 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args([
             "-y",
             "-f", "rawvideo",
-            "-framerate", "24",
+            "-use_wallclock_as_timestamps", "1",
             "-pixel_format", "bgr0",
             "-video_size", &format!("{width}x{height}"),
             "-i", "-", // stdin
-            "-c:v", "mpeg4", // h264_nvenc
+            "-c:v", "mjpeg", // h264_nvenc
              "-pix_fmt", "yuv420p",
             //  "-r", "30", 
             "output/output.mp4"
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .expect("Не удалось открять ffmpeg!");
 
-    let ffmpeg_stdin = ffmpeg.stdin.as_mut().expect("Нет доступа к stdin ffmpeg");
+    let mut ffmpeg_stdin = ffmpeg.stdin.take().expect("Нет доступа к stdin ffmpeg");
 
     let duration = Duration::from_secs(10);
     let start = Instant::now();
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 //     rgba_buf.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 255]);
                 // }
                 // ffmpeg_stdin.write_all(&rgba_buf)?;
-                ffmpeg_stdin.write_all(&frame)?;
+                ffmpeg.stdin.as_mut().unwrap().write_all(&frame)?;
             }
             Err(ref e) => if e.kind() == WouldBlock {
                 thread::sleep(Duration::from_millis(10));
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Останавливаем запись!");
-    // drop(ffmpeg_stdin);
+    drop(ffmpeg_stdin);
     ffmpeg.wait()?;
 
     println!("Видео сохранено: output.mp4");
