@@ -4,7 +4,7 @@ use std::{io::{ErrorKind::WouldBlock, Write}, process::{Command, Stdio}, thread,
 // Говорим, что если все пойдет нормально, то мы вернем (), а
 // если нет, то любую ошибку реализующую интерфейс Error
 // Это нужно, чтобы удобно обрабатывать ошибки с помощью ?
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub fn record_screen() -> Result<(), Box<dyn std::error::Error>> {
 
     let display = Display::primary()?; // Синтаксический сахар
     let mut capturer = Capturer::new(display)?;
@@ -25,14 +25,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
             "-y",
+            "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
+            "-filter_hw_device", "va",
             "-f", "rawvideo",
-            "-use_wallclock_as_timestamps", "1",
             "-pixel_format", "bgr0",
             "-video_size", &format!("{width}x{height}"),
+            "-framerate", "30",
             "-i", "-", // stdin
-            "-c:v", "mjpeg", // h264_nvenc
-             "-pix_fmt", "yuv420p",
-            //  "-r", "30", 
+            // "-vf", "format=nv12,hwupload,scale_vaapi=w=1920:h=1080",
+            "-vf", "format=nv12,hwupload=extra_hw_frames=16",
+            "-c:v", "h264_vaapi", // libx264
+            "-qp", "23", 
             "output/output.mp4"
         ])
         .stdin(Stdio::piped())
@@ -47,12 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while start.elapsed() < duration {
         match capturer.frame() {
             Ok(frame) => {
-                // let mut rgba_buf = Vec::with_capacity(width * height * 4);
-                // for chunk in frame.chunks(4) {
-                //     rgba_buf.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 255]);
-                // }
-                // ffmpeg_stdin.write_all(&rgba_buf)?;
-                ffmpeg.stdin.as_mut().unwrap().write_all(&frame)?;
+                ffmpeg_stdin.write_all(&frame)?;
             }
             Err(ref e) => if e.kind() == WouldBlock {
                 thread::sleep(Duration::from_millis(10));
@@ -74,10 +72,20 @@ pub fn measure_fps(duration_secs: u64) -> Result<f64, Box<dyn std::error::Error>
     let mut capturer = Capturer::new(display)?;
     let start = Instant::now();
     let mut frames = 0;
-
+    let (width, height) = (capturer.width(), capturer.height());
     while start.elapsed().as_secs() < duration_secs {
         match capturer.frame() {
-            Ok(_) => frames += 1,
+            Ok(frame) => {
+                let mut rgba_buf = vec![0u8; width * height * 4];
+                for (i, chunk) in frame.chunks(4).enumerate() {
+                    let j = i * 4;
+                    rgba_buf[j] = chunk[2];     // R
+                    rgba_buf[j + 1] = chunk[1]; // G
+                    rgba_buf[j + 2] = chunk[0]; // B
+                    rgba_buf[j + 3] = 255;      // A
+                }
+                frames += 1;
+            },
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
