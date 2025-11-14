@@ -1,26 +1,30 @@
 use scrap::{Display, Capturer};
 use std::{io::{ErrorKind::WouldBlock, Write}, process::{Command, Stdio}, thread, time::{Duration, Instant}};
+use std::error::Error;
+use ctrlc;
+
 
 // Говорим, что если все пойдет нормально, то мы вернем (), а
 // если нет, то любую ошибку реализующую интерфейс Error
 // Это нужно, чтобы удобно обрабатывать ошибки с помощью ?
 pub fn record_screen() -> Result<(), Box<dyn std::error::Error>> {
 
+    let fps = 30;
     let display = Display::primary()?; // Синтаксический сахар
     let mut capturer = Capturer::new(display)?;
 
     let (width, height) = (capturer.width(), capturer.height());
     println!("Размеры экрана {}x{}", width, height);
 
-    // Настраиваем ffmpeg
-    // -f rawvideo: принимаем сырые кадры
-    // -pixel_format rgba: 4 байта на пиксель
-    // -video_size: размер кадра
-    // -framerate 30: FPS
-    // -i - : читаем видео через stdin
-    // -c: v h264_nvec (или libx264): кодек
-    // -preset fast: профиль кодировния
-    // -y output.mp4: выходной файл
+
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag_clone = stop_flag.clone();
+    ctrlc::set_handler(move || {
+        stop_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        println!("Завершаем запись!");
+    })?;
+    
+
 
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
@@ -44,17 +48,35 @@ pub fn record_screen() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ffmpeg_stdin = ffmpeg.stdin.take().expect("Нет доступа к stdin ffmpeg");
 
-    let duration = Duration::from_secs(10);
-    let start = Instant::now();
+    // let duration = Duration::from_secs(10);
+    // let start = Instant::now();
+    
+    let frame_duration = Duration::from_micros(1_000_000 / fps); // 30 FPS
+    let mut last_frame_time = Instant::now();
 
-    while start.elapsed() < duration {
+    loop {
+
+        if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+
+
+
+        let now = Instant::now();
+        if now - last_frame_time < frame_duration {
+            thread::sleep(frame_duration - (now - last_frame_time))
+        }
+        
+        last_frame_time = Instant::now();
+        
         match capturer.frame() {
             Ok(frame) => {
                 ffmpeg_stdin.write_all(&frame)?;
             }
-            Err(ref e) => if e.kind() == WouldBlock {
-                thread::sleep(Duration::from_millis(10));
-                continue;
+            Err(ref e) => {
+                if e.kind() == WouldBlock {
+                    continue;
+                }
             }
         }
     }
