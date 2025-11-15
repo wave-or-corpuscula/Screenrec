@@ -10,3 +10,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     record_screen()?;
     Ok(())
 }
+
+/*
+todo:
+    scrap - для записи экрана (+ звук внутри компьютера)
+    cpal - для записи микрофона
+
+*/

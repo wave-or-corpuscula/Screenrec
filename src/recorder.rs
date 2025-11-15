@@ -1,93 +1,186 @@
-use scrap::{Display, Capturer};
-use std::{io::{ErrorKind::WouldBlock, Write}, process::{Command, Stdio}, thread, time::{Duration, Instant}};
-use std::error::Error;
 use ctrlc;
 
+use nix::unistd::Pid;
+use nix::sys::signal::{kill, Signal};
 
-// Говорим, что если все пойдет нормально, то мы вернем (), а
-// если нет, то любую ошибку реализующую интерфейс Error
-// Это нужно, чтобы удобно обрабатывать ошибки с помощью ?
-pub fn record_screen() -> Result<(), Box<dyn std::error::Error>> {
+use scrap::{Display, Capturer};
+use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::{io::{ErrorKind::WouldBlock, Write}, process::{Command, Stdio}, thread, time::{Duration, Instant}};
 
-    let fps = 30;
-    let display = Display::primary()?; // Синтаксический сахар
+
+pub fn record_screen() -> Result<(), Box<dyn Error>> {
+    // --- Параметры ---
+    // Можно менять
+    let out_path = "output/output.mp4";
+    // если хочешь, подставь конкретное имя мониторного источника PulseAudio,
+    // например "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor".
+    // По умолчанию используем "default" (может быть перенаправлен системно на .monitor)
+    let audio_source = std::env::var("AUDIO_SOURCE").unwrap_or_else(|_| "default".to_string());
+    // частота вывода кадров (как хочешь)
+    let target_fps: u32 = 30;
+
+    // --- Инициализация scrap ---
+    let display = Display::primary()?;
     let mut capturer = Capturer::new(display)?;
-
     let (width, height) = (capturer.width(), capturer.height());
-    println!("Размеры экрана {}x{}", width, height);
+    println!("Screen size: {}x{}", width, height);
 
+    // --- Обработка Ctrl+C: только ставим флаг ---
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    {
+        let stop_flag_clone = stop_flag.clone();
+        ctrlc::set_handler(move || {
+            // Сигнал пришёл — ставим флаг. Всё остальное сделает основной поток.
+            stop_flag_clone.store(true, Ordering::SeqCst);
+            eprintln!("Ctrl+C получен — начинаем корректное завершение...");
+        }).expect("Не удалось установить Ctrl-C handler");
+    }
 
-    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_flag_clone = stop_flag.clone();
-    ctrlc::set_handler(move || {
-        stop_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        println!("Завершаем запись!");
-    })?;
-    
+    // --- Запуск ffmpeg ---
+    // Мы будем передавать кадры в stdin ffmpeg (rawvideo bgr0).
+    // ffmpeg сам откроет PulseAudio источник (audio_source).
+    let mut ffmpeg_cmd = Command::new("ffmpeg");
 
+    // Формируем аргументы как Vec<String>, т.к. размеры — runtime
+    let args = vec![
+        "-y".to_string(),
+        // инициализируем vaapi device (на Intel)
+        "-init_hw_device".to_string(), "vaapi=va:/dev/dri/renderD128".to_string(),
+        "-filter_hw_device".to_string(), "va".to_string(),
 
-    let mut ffmpeg = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
-            "-filter_hw_device", "va",
-            "-f", "rawvideo",
-            "-pixel_format", "bgr0",
-            "-video_size", &format!("{width}x{height}"),
-            "-framerate", "30",
-            "-i", "-", // stdin
-            // "-vf", "format=nv12,hwupload,scale_vaapi=w=1920:h=1080",
-            "-vf", "format=nv12,hwupload=extra_hw_frames=16",
-            "-c:v", "h264_vaapi", // libx264
-            "-qp", "23", 
-            "output/output.mp4"
-        ])
+        // видео вход (stdin)
+        "-f".to_string(), "rawvideo".to_string(),
+        "-pixel_format".to_string(), "bgr0".to_string(),
+        "-video_size".to_string(), format!("{}x{}", width, height),
+        "-framerate".to_string(), format!("{}", target_fps),
+        "-i".to_string(), "-".to_string(),
+
+        // аудио вход (PulseAudio). Заменяй audio_source, если нужно.
+        "-f".to_string(), "pulse".to_string(),
+        "-i".to_string(), audio_source.clone(),
+
+        // фильтры и hwupload
+        "-vf".to_string(), "format=nv12,hwupload=extra_hw_frames=16".to_string(),
+
+        // видеокодек на VAAPI (Intel)
+        "-c:v".to_string(), "h264_vaapi".to_string(),
+        "-qp".to_string(), "23".to_string(),
+
+        // аудиокодек
+        "-c:a".to_string(), "aac".to_string(),
+        "-b:a".to_string(), "192k".to_string(),
+
+        out_path.to_string(),
+    ];
+
+    // Запускаем
+    let mut child = ffmpeg_cmd
+        .args(&args)
         .stdin(Stdio::piped())
         .spawn()
-        .expect("Не удалось открять ffmpeg!");
+        .expect("Не удалось запустить ffmpeg. Проверь путь и аргументы.");
 
-    let mut ffmpeg_stdin = ffmpeg.stdin.take().expect("Нет доступа к stdin ffmpeg");
+    println!("Запущен ffmpeg (pid {}).", child.id());
+    println!("FFmpeg args: {:?}", args);
 
-    // let duration = Duration::from_secs(10);
-    // let start = Instant::now();
-    
-    let frame_duration = Duration::from_micros(1_000_000 / fps); // 30 FPS
+    // Берём stdin ffmpeg
+    let mut ffmpeg_stdin = child.stdin.take().expect("stdin ffmpeg оказался None");
+
+    // Frame limiter
+    let frame_duration = Duration::from_micros(1_000_000u64 / target_fps as u64);
     let mut last_frame_time = Instant::now();
 
-    loop {
+    // Счётчик FPS для отладки
+    let mut frames_sent: u64 = 0;
+    let mut fps_print_time = Instant::now();
 
-        if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
+    println!("Запись началась — нажмите Ctrl+C для остановки.");
 
-
-
+    // --- Основной цикл: пока пользователь не нажал Ctrl+C ---
+    while !stop_flag.load(Ordering::SeqCst) {
+        // Стабилизация интервала (чтобы ffmpeg получал кадры ровно с target_fps)
         let now = Instant::now();
         if now - last_frame_time < frame_duration {
-            thread::sleep(frame_duration - (now - last_frame_time))
+            thread::sleep(frame_duration - (now - last_frame_time));
         }
-        
         last_frame_time = Instant::now();
-        
+
         match capturer.frame() {
             Ok(frame) => {
-                ffmpeg_stdin.write_all(&frame)?;
-            }
-            Err(ref e) => {
-                if e.kind() == WouldBlock {
-                    continue;
+                // frame — &[u8] в формате B G R X (bgr0)
+                // Записываем "как есть" — ffmpeg сделает конвертацию format=nv12,hwupload
+                if let Err(e) = ffmpeg_stdin.write_all(&frame) {
+                    eprintln!("Ошибка записи в stdin ffmpeg: {}", e);
+                    // Если BrokenPipe — process, вероятно, умер. Прекращаем цикл.
+                    break;
                 }
+                frames_sent += 1;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // кадр пока не готов — просто продолжаем (следующая итерация)
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Ошибка захвата кадра: {}", e);
+                break;
+            }
+        }
+
+        // Печатаем FPS раз в 2 секунды (по желанию)
+        if fps_print_time.elapsed() >= Duration::from_secs(2) {
+            let fps = frames_sent as f64 / fps_print_time.elapsed().as_secs_f64();
+            println!("Отправлено кадров: {}, ~FPS: {:.2}", frames_sent, fps);
+            // сбросим счётчик и таймер
+            frames_sent = 0;
+            fps_print_time = Instant::now();
+        }
+    }
+
+    // --- Начинаем корректное завершение ffmpeg ---
+    eprintln!("Начинаем корректное завершение ffmpeg...");
+
+    // 1) Закрываем stdin — видео-поток закончился (EOF)
+    drop(ffmpeg_stdin);
+
+    // 2) Отправляем SIGTERM — мягкое завершение (чтобы ffmpeg остановил аудио-вход и дописал файл)
+    let pid = child.id() as i32;
+    let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+
+    // 3) Ждём завершения процесса с таймаутом (например, 8 секунд).
+    let mut waited = 0u32;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                println!("ffmpeg завершился с статусом: {}", status);
+                break;
+            }
+            Ok(None) => {
+                // ещё жив — подождём немного
+                if waited >= 80 { // 80 * 100ms = 8s
+                    eprintln!("ffmpeg не завершился за 8s — посылаем SIGKILL");
+                    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+                    // даём ещё секунду и выходим
+                    thread::sleep(Duration::from_secs(1));
+                    let _ = child.wait();
+                    break;
+                } else {
+                    waited += 1;
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(e) => {
+                eprintln!("Ошибка проверки состояния ffmpeg: {}", e);
+                break;
             }
         }
     }
 
-    println!("Останавливаем запись!");
-    drop(ffmpeg_stdin);
-    ffmpeg.wait()?;
-
-    println!("Видео сохранено: output.mp4");
+    println!("Готово. Видео сохранено в {}", out_path);
     Ok(())
 }
+
 
 pub fn measure_fps(duration_secs: u64) -> Result<f64, Box<dyn std::error::Error>> {
     let display = Display::primary()?;
@@ -118,3 +211,5 @@ pub fn measure_fps(duration_secs: u64) -> Result<f64, Box<dyn std::error::Error>
     let fps = frames as f64 / duration_secs as f64;
     Ok(fps)
 }
+
+// todo: OOP here
