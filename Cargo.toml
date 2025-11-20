@@ -8,7 +8,5 @@ scrap = "0.5.0"
 image = "0.24"
 ctrlc = "3.5"
 nix = { version = "0.27", features = ["signal"] }
-
-[[bin]]
-name="fps_test"
-path="src/tests/scrap_fps.rs"
+ffmpeg-next = "8.0"
+anyhow = "1.0"
